@@ -1,158 +1,105 @@
-import joblib
-import pandas as pd
-import numpy as np
-from fastapi import FastAPI, Request, HTTPException
-from sklearn.preprocessing import StandardScaler
-import warnings
+from fastapi import FastAPI, Request
+import re
+import json
 
-warnings.filterwarnings('ignore')
-
-# Initialize FastAPI App
 app = FastAPI()
 
-# Load trained model and label encoders
-try:
-    model = joblib.load("cybersecurity_model.pkl")
-    label_encoders = joblib.load("label_encoders.pkl")
-except Exception as e:
-    print(f"Error loading model: {str(e)}")
-    raise
+COMMON_ATTACK_KEYWORDS = [
+    "SELECT", "DROP", "UNION", "INSERT", "DELETE", "UPDATE",  # SQL Injection
+    "<script>", "onerror=", "alert(", "eval(", "javascript:",  # XSS
+    "wget", "curl", "nc", "ncat", "chmod", "exec(", "system(",  # Command Injection
+    "botnet", "flood", "slowloris", "DOS",                      # DDoS
+    "../", "/etc/passwd", "/proc/self",                         # LFI/RFI
+    "base64_decode(", "phpinfo()",                              # PHP Code Injection
+    "Bearer ", "API_KEY=", "Authorization:", "Set-Cookie:",     # API Attacks
+]
 
-# Define expected features
-FEATURES = ["Protocol", "Traffic Type", "Action Taken", "Severity Level", 
-            "Network Segment", "User-Agent", "Source Port", "Destination Port", 
-            "Packet Length", "Anomaly Scores"]
+ATTACK_PATTERNS = {
+    "SQL Injection": [
+        r"(?i)(or\s+1=1)", 
+        r"(?i)(union\s+select)",
+        r"(?i)(select\s+\*\s+from)",
+        r"(?i)(insert\s+into\s+\w+\s+values)",
+        r"(?i)(drop\s+table\s+\w+)"
+    ],
+    "Cross-Site Scripting (XSS)": [
+        r"<script>.*</script>", 
+        r"(?i)(onerror\s*=)",
+        r"(?i)(alert\s*\()",
+        r"(?i)(document\.cookie)",
+        r"(?i)(javascript:\s*)"
+    ],
+    "Command Injection": [
+        r"(?i)(wget\s+http)", 
+        r"(?i)(curl\s+-o)", 
+        r"(?i)(nc\s+-e\s+/bin/sh)",
+        r"(?i)(;.*rm\s+-rf\s+/)",
+        r"(?i)(&&\s*echo\s*root)"
+    ],
+    "DDoS Attack Indicators": [
+        r"(?i)(botnet)", 
+        r"(?i)(slowloris)", 
+        r"(?i)(http flood)",
+        r"(?i)(rate limit bypass)",
+        r"(?i)(SYN flood)"
+    ],
+    "LFI (Local File Inclusion)": [
+        r"(?i)(\.\./\.\./)", 
+        r"(?i)(/etc/passwd)",
+        r"(?i)(/proc/self/environ)"
+    ],
+    "RFI (Remote File Inclusion)": [
+        r"(?i)(http://.*\.php)", 
+        r"(?i)(https://.*\.php)",
+        r"(?i)(php://input)"
+    ],
+    "API Attack": [
+        r"(?i)(Bearer\s+[A-Za-z0-9-_]+)", 
+        r"(?i)(Authorization:\s*Bearer)",
+        r"(?i)(api_key=[A-Za-z0-9-_]+)"
+    ],
+}
 
-CATEGORICAL_FEATURES = ["Protocol", "Traffic Type", "Action Taken", "Severity Level", 
-                        "Network Segment", "User-Agent"]
-NUMERIC_FEATURES = ["Source Port", "Destination Port", "Packet Length", "Anomaly Scores"]
+def keyword_match(payload_str):
+    """Checks if the payload contains common attack keywords."""
+    for keyword in COMMON_ATTACK_KEYWORDS:
+        if keyword.lower() in payload_str.lower():
+            return True 
+    return False  
 
-def preprocess_request(data: dict):
-    """Preprocess a single request for prediction."""
-    try:
-        df = pd.DataFrame([data])
-
-        # Ensure all expected columns exist
-        for col in FEATURES:
-            if col not in df.columns:
-                df[col] = 0
-
-        # Handle categorical features
-        for col in CATEGORICAL_FEATURES:
-            if col in df.columns:
-                df[col] = df[col].astype(str)
-                if col in label_encoders:
-                    le = label_encoders[col]
-                    try:
-                        df[col] = le.transform(df[col])
-                    except ValueError:
-                        df[col] = df[col].apply(lambda x: le.transform([x])[0] if x in le.classes_ else -1)
-
-
-        # Handle numeric features
-        scaler = StandardScaler()
-        for col in NUMERIC_FEATURES:
-            if col in df.columns:
-                df[col] = scaler.fit_transform(df[[col]])
-
-        # Ensure correct feature order
-        df = df[FEATURES]
-        return df
-
-    except Exception as e:
-        raise ValueError(f"Error in preprocessing: {str(e)}")
-
-
-def deep_packet_inspection(request_data):
-    """
-    Performs Deep Packet Inspection (DPI) on blocked requests.
-    Scans for anomalies, malware signatures, or suspicious payload data.
-    """
-    try:
-        # 🚀 Example: Check for suspicious payload keywords
-        suspicious_keywords = ["malware", "exploit", "trojan", "phishing", "attack"]
-        
-        # Convert request data to string for scanning
-        raw_data = str(request_data).lower()
-        
-        detected_signatures = [keyword for keyword in suspicious_keywords if keyword in raw_data]
-
-        if detected_signatures:
-            return {
-                "dpi_status": "Threat Detected",
-                "malicious_content": detected_signatures
-            }
-        else:
-            return {
-                "dpi_status": "No Threat Detected"
-            }
+def dpi_analysis(payload_str):
+    """Scans for known attack patterns using regex."""
+    detected_attacks = {}
     
-    except Exception as e:
+    for attack_type, patterns in ATTACK_PATTERNS.items():
+        matches = [pattern for pattern in patterns if re.search(pattern, payload_str)]
+        if matches:
+            detected_attacks[attack_type] = matches
+    
+    if detected_attacks:
         return {
-            "dpi_status": "DPI Error",
-            "error": str(e)
+            "status": "Blocked",
+            "reason": "Confirmed Malicious Request",
+            "attacks_detected": detected_attacks
         }
-
+    
+    return {
+        "status": "Potential Threat",
+        "message": "Suspicious but no known attack detected",
+        "classification": "Unknown Attack"
+    }
 
 @app.post("/predict/")
-async def predict(request: Request):
-    """Analyze incoming request & classify as malicious or safe."""
+async def detect_attack(request: Request):
     try:
-        data = await request.json()
+        payload = await request.json()
+        payload_str = json.dumps(payload)
 
-        # Validate input data
-        missing_features = [f for f in FEATURES if f not in data]
-        if missing_features:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Missing required features: {missing_features}"
-            )
+        if keyword_match(payload_str):
+            dpi_result = dpi_analysis(payload_str)
+            return dpi_result
 
-        # Preprocess the request
-        processed_data = preprocess_request(data)
+        return {"status": "Allowed", "message": "Request is safe"}
 
-        # Make prediction
-        prediction = model.predict(processed_data)[0]
-        probability = model.predict_proba(processed_data)[0]
-
-        # Get feature importance scores
-        importance_scores = dict(zip(FEATURES, abs(model.coef_[0])))
-        top_features = dict(sorted(
-            importance_scores.items(), 
-            key=lambda x: abs(x[1]), 
-            reverse=True
-        )[:3])
-
-        response = {
-            "status": "Blocked" if prediction == 1 else "Allowed",
-            "confidence": float(max(probability)),
-            "risk_score": float(probability[1]),  # Probability of being malicious
-            "key_indicators": top_features,
-            "prediction": int(prediction),
-            "timestamp": pd.Timestamp.now().isoformat()
-        }
-
-        # If blocked, send request to Deep Packet Inspection (DPI)
-        if prediction == 1:
-            dpi_result = deep_packet_inspection(data)
-            response["dpi_result"] = dpi_result
-
-        return response
-
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Prediction error: {str(e)}"
-        )
-
-
-@app.get("/health/")
-async def health_check():
-    """API health check endpoint."""
-    return {
-        "status": "healthy",
-        "model_loaded": model is not None,
-        "encoders_loaded": label_encoders is not None
-    }
+        return {"error": str(e)}
